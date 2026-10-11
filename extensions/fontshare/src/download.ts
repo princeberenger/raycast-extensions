@@ -1,5 +1,4 @@
 import { open, showInFinder, showToast, Toast } from "@raycast/api";
-import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
@@ -14,15 +13,22 @@ function fileNameFrom(response: Response, fallback: string): string {
   return basename(name?.trim() || fallback);
 }
 
-// Never overwrite an earlier download: "Satoshi_Complete.zip" becomes "Satoshi_Complete 2.zip".
-function availablePath(dir: string, fileName: string): string {
+/**
+ * Writes `data` under the first free name: "Satoshi_Complete.zip", then "Satoshi_Complete 2.zip"… The exclusive
+ * create ("wx") makes the check and the write one step, so concurrent downloads never overwrite each other.
+ */
+async function writeToFreePath(dir: string, fileName: string, data: Buffer): Promise<string> {
   const extension = extname(fileName);
   const stem = fileName.slice(0, fileName.length - extension.length);
-  let candidate = join(dir, fileName);
-  for (let index = 2; existsSync(candidate); index++) {
-    candidate = join(dir, `${stem} ${index}${extension}`);
+  for (let index = 1; ; index++) {
+    const candidate = join(dir, index === 1 ? fileName : `${stem} ${index}${extension}`);
+    try {
+      await writeFile(candidate, data, { flag: "wx" });
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
-  return candidate;
 }
 
 /** Downloads a Fontshare zip to the user's Downloads folder and reports progress with a toast. */
@@ -33,8 +39,8 @@ export async function downloadZip(url: string, title: string, fallbackFileName: 
     const response = await fetchFontshare(url);
     const dir = join(homedir(), "Downloads");
     await mkdir(dir, { recursive: true });
-    const file = availablePath(dir, fileNameFrom(response, fallbackFileName));
-    await writeFile(file, Buffer.from(await response.arrayBuffer()));
+    const data = Buffer.from(await response.arrayBuffer());
+    const file = await writeToFreePath(dir, fileNameFrom(response, fallbackFileName), data);
 
     toast.style = Toast.Style.Success;
     toast.title = `Downloaded ${title}`;

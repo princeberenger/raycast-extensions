@@ -5,7 +5,7 @@ import { downloadZip } from "./download";
 import { DOWNLOAD_SHORTCUT, fontFamilyCss, INSTALL_SHORTCUT, WebCodeActions } from "./font-actions";
 import FontDetail from "./font-detail";
 import { canInstallFonts, installFonts } from "./install";
-import { themedSvg, usePairPreviews } from "./preview";
+import { markdownImageUrl, usePairPreviews } from "./preview";
 import { Catalog } from "./use-catalog";
 
 // Both fonts of a pair, merged when the pairing uses two styles of the same family.
@@ -86,17 +86,22 @@ function describe(pairFont: PairFont): string {
 
 export default function PairDetail({ pair, catalog }: { pair: FontPair; catalog: Catalog }) {
   const pairs = useMemo(() => [pair], [pair]);
-  const preview = usePairPreviews(pairs).files[pair.id];
+  const { files, failed, retry } = usePairPreviews(pairs);
+  const preview = files[pair.id];
+  const hasFailed = failed.includes(pair.id);
 
-  const markdown = [
-    `# ${pair.title}`,
-    preview ? `![${pair.title}](file://${encodeURI(themedSvg(preview))})` : "_Rendering preview…_",
-  ].join("\n\n");
+  let body = "_Rendering preview…_";
+  if (preview) {
+    body = `![${pair.title}](${markdownImageUrl(preview)})`;
+  } else if (hasFailed) {
+    body = "_Could not render the preview. Check your internet connection and try again._";
+  }
+  const markdown = `# ${pair.title}\n\n${body}`;
 
   return (
     <Detail
       navigationTitle={pair.title}
-      isLoading={!preview}
+      isLoading={!preview && !hasFailed}
       markdown={markdown}
       metadata={
         <Detail.Metadata>
@@ -107,7 +112,11 @@ export default function PairDetail({ pair, catalog }: { pair: FontPair; catalog:
           <Detail.Metadata.Link title="Body Font" target={pair.body.url} text={pair.body.name} />
         </Detail.Metadata>
       }
-      actions={<PairActions pair={pair} catalog={catalog} />}
+      actions={
+        <PairActions pair={pair} catalog={catalog}>
+          {hasFailed ? <Action title="Retry Preview" icon={Icon.ArrowClockwise} onAction={retry} /> : undefined}
+        </PairActions>
+      }
     />
   );
 }

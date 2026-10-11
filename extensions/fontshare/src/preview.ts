@@ -1,9 +1,10 @@
 import { environment } from "@raycast/api";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { useEffect, useMemo, useState } from "react";
+import { pathToFileURL } from "node:url";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Font, FontPair } from "./api";
 import { renderPairSvg, renderSampleSvg, renderTextSvg } from "./render-svg";
 
@@ -12,20 +13,25 @@ export const PREVIEW_PLACEHOLDER = "preview-placeholder.svg";
 
 const CONCURRENCY = 6;
 // Bump when the rendering changes so stale images are regenerated.
-const RENDER_VERSION = 5;
+const RENDER_VERSION = 6;
 // Raycast grids scale images so that only their top-left 90% fills the cell (measured with a calibration image),
 // which crops the right and bottom edges. Previews add a matching transparent margin there.
 const GRID_VISIBLE_FRACTION = 0.9;
 
 export interface RenderedImages {
+  // Grid-ready SVG (with the grid margin) of each rendered job.
   files: Record<string, string>;
+  // Ids whose rendering failed (e.g. offline); `retry` tries them again.
+  failed: string[];
   // True while some images are still being rendered for the first time.
   isRendering: boolean;
+  retry: () => void;
 }
 
 interface RenderJob {
   id: string;
-  fileName: string;
+  // Cache file name without extension: "<name>.svg" is the drawing, "<name>.grid.svg" its grid-ready copy.
+  name: string;
   render: () => Promise<string>;
 }
 
@@ -75,10 +81,39 @@ function fetchFontData(url: string): Promise<ArrayBuffer> {
   return data;
 }
 
-/** Returns the cached SVG path of each job, rendering missing ones in the background. */
+// Writes through a unique temporary file, then renames, so a cancelled or concurrent write never leaves a truncated
+// file and two writers never share a temporary path.
+async function writeAtomically(file: string, content: string): Promise<void> {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temporary, content);
+  await rename(temporary, file);
+}
+
+// The grid and a detail view can request the same image at once; share one render per cache file.
+const inFlight = new Map<string, Promise<void>>();
+
+function renderToCache(dir: string, job: RenderJob, gridFile: string): Promise<void> {
+  let rendering = inFlight.get(gridFile);
+  if (!rendering) {
+    rendering = (async () => {
+      const svg = await job.render();
+      await mkdir(dir, { recursive: true });
+      // The plain drawing is written first so the grid file's existence implies both are ready.
+      await writeAtomically(join(dir, `${job.name}.svg`), svg);
+      await writeAtomically(gridFile, fitGridCell(svg));
+    })().finally(() => inFlight.delete(gridFile));
+    inFlight.set(gridFile, rendering);
+  }
+  return rendering;
+}
+
+/** Returns the cached grid SVG path of each job, rendering missing ones in the background. */
 function useRenderedImages(cache: string, jobs: RenderJob[] | undefined): RenderedImages {
   const [files, setFiles] = useState<Record<string, string>>({});
+  const [failed, setFailed] = useState<string[]>([]);
   const [pending, setPending] = useState(0);
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => setAttempt((count) => count + 1), []);
 
   useEffect(() => {
     if (!jobs) {
@@ -91,7 +126,7 @@ function useRenderedImages(cache: string, jobs: RenderJob[] | undefined): Render
     const queue: (RenderJob & { file: string })[] = [];
 
     for (const job of jobs) {
-      const file = join(dir, job.fileName);
+      const file = join(dir, `${job.name}.grid.svg`);
       if (existsSync(file)) {
         cached[job.id] = file;
       } else {
@@ -99,21 +134,19 @@ function useRenderedImages(cache: string, jobs: RenderJob[] | undefined): Render
       }
     }
     setFiles(cached);
+    setFailed([]);
     setPending(queue.length);
     removeStaleCaches(cache).catch((error) => console.error(`Could not remove stale ${cache}`, error));
 
     const worker = async () => {
       for (let job = queue.shift(); job && !cancelled; job = queue.shift()) {
+        const { id, file } = job;
         try {
-          const svg = fitGridCell(await job.render());
-          await mkdir(dir, { recursive: true });
-          // Write then rename so a cancelled run never leaves a truncated file in the cache.
-          await writeFile(`${job.file}.tmp`, svg);
-          await rename(`${job.file}.tmp`, job.file);
-          const { id, file } = job;
+          await renderToCache(dir, job, file);
           if (!cancelled) setFiles((current) => ({ ...current, [id]: file }));
         } catch (error) {
-          console.error(`Could not render ${cache} image ${job.id}`, error);
+          console.error(`Could not render ${cache} image ${id}`, error);
+          if (!cancelled) setFailed((current) => [...current, id]);
         }
         if (!cancelled) setPending((count) => count - 1);
       }
@@ -123,9 +156,9 @@ function useRenderedImages(cache: string, jobs: RenderJob[] | undefined): Render
     return () => {
       cancelled = true;
     };
-  }, [cache, jobs]);
+  }, [cache, jobs, attempt]);
 
-  return { files, isRendering: pending > 0 };
+  return { files, failed, isRendering: pending > 0, retry };
 }
 
 /** "Aa" previews keyed by font id. */
@@ -138,7 +171,7 @@ export function useFontPreviews(fonts: Font[] | undefined, enabled: boolean): Re
             if (!preview) return [];
             return {
               id: font.id,
-              fileName: `${font.id}-${preview.styleId}.svg`,
+              name: `${font.id}-${preview.styleId}`,
               render: async () => renderSampleSvg(await fetchFontData(preview.woffUrl)),
             };
           })
@@ -154,7 +187,7 @@ export function usePairPreviews(pairs: FontPair[] | undefined): RenderedImages {
     () =>
       pairs?.map((pair) => ({
         id: pair.id,
-        fileName: `${pair.id}-${pair.headline.styleId}-${pair.body.styleId}.svg`,
+        name: `${pair.id}-${pair.headline.styleId}-${pair.body.styleId}`,
         render: async () => {
           const [headline, body] = await Promise.all([
             fetchFontData(pair.headline.woffUrl),
@@ -195,7 +228,7 @@ export function useTextPreviews(fonts: Font[] | undefined, text: string): Render
         if (!preview) return [];
         return {
           id: font.id,
-          fileName: `${textKey}-${font.id}-${preview.styleId}.svg`,
+          name: `${textKey}-${font.id}-${preview.styleId}`,
           render: async () => renderTextSvg(await fetchFontData(preview.woffUrl), text),
         };
       }),
@@ -205,14 +238,17 @@ export function useTextPreviews(fonts: Font[] | undefined, text: string): Render
 }
 
 /**
- * Markdown images don't support `tintColor` reliably, so write a copy of the SVG filled with a color that suits the
- * current appearance and return its path.
+ * Returns a file URL for showing a cached image in markdown. Markdown doesn't crop like grids and doesn't support
+ * `tintColor` reliably, so it uses the drawing without the grid margin, filled with a color that suits the current
+ * appearance.
  */
-export function themedSvg(file: string): string {
-  const themed = file.replace(/\.svg$/, `-${environment.appearance}.svg`);
+export function markdownImageUrl(gridFile: string): string {
+  const themed = gridFile.replace(/\.grid\.svg$/, `-${environment.appearance}.svg`);
   if (!existsSync(themed)) {
     const fill = environment.appearance === "dark" ? "#ececec" : "#1c1c1c";
-    writeFileSync(themed, readFileSync(file, "utf8").replace("<svg ", `<svg fill="${fill}" `));
+    const svg = readFileSync(gridFile.replace(/\.grid\.svg$/, ".svg"), "utf8");
+    writeFileSync(themed, svg.replace("<svg ", `<svg fill="${fill}" `));
   }
-  return themed;
+  // pathToFileURL handles Windows paths (drive letters, backslashes) as well as spaces.
+  return pathToFileURL(themed).href;
 }

@@ -42,9 +42,10 @@ export function fontsToInstall(files: string[]): string[] {
 /** Downloads a Fontshare zip and copies its desktop fonts to ~/Library/Fonts (macOS only). */
 export async function installFonts(url: string, title: string): Promise<void> {
   const toast = await showToast({ style: Toast.Style.Animated, title: `Installing ${title}…` });
-  const workDir = await mkdtemp(join(tmpdir(), "fontshare-"));
+  let workDir: string | undefined;
 
   try {
+    workDir = await mkdtemp(join(tmpdir(), "fontshare-"));
     const response = await fetchFontshare(url);
     const zip = join(workDir, "fonts.zip");
     await writeFile(zip, Buffer.from(await response.arrayBuffer()));
@@ -67,6 +68,6 @@ export async function installFonts(url: string, title: string): Promise<void> {
     toast.title = `Could not install ${title}`;
     toast.message = error instanceof Error ? error.message : String(error);
   } finally {
-    await rm(workDir, { recursive: true, force: true });
+    if (workDir) await rm(workDir, { recursive: true, force: true });
   }
 }
